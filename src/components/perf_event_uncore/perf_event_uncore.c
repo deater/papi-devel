@@ -10,10 +10,9 @@
 *          the ability to set cpu number to use or control the domain (user, kernel, or both)
 *          in which the counter should be incremented.  These are event masks so it is now
 *          possible to have multiple events in the same event set that count activity from
-*          differennt cpu's or count activity in different domains.
+*          different cpus or count activity in different domains.
 */
 
-#include <stdio.h>
 #include <fcntl.h>
 #include <string.h>
 #include <errno.h>
@@ -44,17 +43,7 @@
 #include "linux-context.h"
 
 #include "components/perf_event/perf_event_lib.h"
-
-/* Forward declaration */
-papi_vector_t _perf_event_uncore_vector;
-
-/* Globals */
-struct native_event_table_t uncore_native_event_table;
-static int our_cidx;
-//int
-//_peu_libpfm4_get_cidx() {
-//	return our_cidx;
-//}
+#include "components/perf_event/perf_helpers.h"
 
 /* Defines for ctx->state */
 #define PERF_EVENTS_OPENED  0x01
@@ -65,9 +54,14 @@ static int our_cidx;
 // something just in case there is programmer error in invoking the function.
 #define HANDLE_STRING_ERROR {fprintf(stderr,"%s:%i unexpected string function error.\n",__FILE__,__LINE__); exit(-1);}
 
-static int _peu_set_domain( hwd_control_state_t *ctl, int domain);
-static int _peu_shutdown_component( void );
 
+/* Forward declaration */
+papi_vector_t _perf_event_uncore_vector;
+
+/* Globals */
+struct native_event_table_t uncore_native_event_table;
+static int our_cidx;
+static int exclude_guest_unsupported;
 
 
 /******************************************************************/
@@ -107,76 +101,9 @@ get_read_format( unsigned int multiplex,
 /********* End Kernel-version Dependent Routines  ****************/
 /*****************************************************************/
 
-/********************************************************************/
-/* Low-level perf_event calls                                       */
-/********************************************************************/
-
-/* In case headers aren't new enough to have __NR_perf_event_open */
-#ifndef __NR_perf_event_open
-
-#ifdef __powerpc__
-#define __NR_perf_event_open	319
-#elif defined(__x86_64__)
-#define __NR_perf_event_open	298
-#elif defined(__i386__)
-#define __NR_perf_event_open	336
-#elif defined(__arm__)          366+0x900000
-#define __NR_perf_event_open
-#endif
-
-#endif
-
-static long
-sys_perf_event_open( struct perf_event_attr *hw_event, pid_t pid, int cpu,
-					   int group_fd, unsigned long flags )
-{
-   int ret;
-
-   SUBDBG("sys_perf_event_open(hw_event: %p, pid: %d, cpu: %d, group_fd: %d, flags: %lx\n",hw_event,pid,cpu,group_fd,flags);
-   SUBDBG("   type: %d\n",hw_event->type);
-   SUBDBG("   size: %d\n",hw_event->size);
-   SUBDBG("   config: %#"PRIx64" (%"PRIu64")\n",hw_event->config,
-	  hw_event->config);
-   SUBDBG("   sample_period: %"PRIu64"\n",hw_event->sample_period);
-   SUBDBG("   sample_type: %"PRIu64"\n",hw_event->sample_type);
-   SUBDBG("   read_format: %"PRIu64"\n",hw_event->read_format);
-   SUBDBG("   disabled: %d\n",hw_event->disabled);
-   SUBDBG("   inherit: %d\n",hw_event->inherit);
-   SUBDBG("   pinned: %d\n",hw_event->pinned);
-   SUBDBG("   exclusive: %d\n",hw_event->exclusive);
-   SUBDBG("   exclude_user: %d\n",hw_event->exclude_user);
-   SUBDBG("   exclude_kernel: %d\n",hw_event->exclude_kernel);
-   SUBDBG("   exclude_hv: %d\n",hw_event->exclude_hv);
-   SUBDBG("   exclude_idle: %d\n",hw_event->exclude_idle);
-   SUBDBG("   mmap: %d\n",hw_event->mmap);
-   SUBDBG("   comm: %d\n",hw_event->comm);
-   SUBDBG("   freq: %d\n",hw_event->freq);
-   SUBDBG("   inherit_stat: %d\n",hw_event->inherit_stat);
-   SUBDBG("   enable_on_exec: %d\n",hw_event->enable_on_exec);
-   SUBDBG("   task: %d\n",hw_event->task);
-   SUBDBG("   watermark: %d\n",hw_event->watermark);
-   SUBDBG("   precise_ip: %d\n",hw_event->precise_ip);
-   SUBDBG("   mmap_data: %d\n",hw_event->mmap_data);
-   SUBDBG("   sample_id_all: %d\n",hw_event->sample_id_all);
-   SUBDBG("   exclude_host: %d\n",hw_event->exclude_host);
-   SUBDBG("   exclude_guest: %d\n",hw_event->exclude_guest);
-   SUBDBG("   exclude_callchain_kernel: %d\n",hw_event->exclude_callchain_kernel);
-   SUBDBG("   exclude_callchain_user: %d\n",hw_event->exclude_callchain_user);
-   SUBDBG("   wakeup_watermark: %d\n",hw_event->wakeup_watermark);
-   SUBDBG("   bp_type: %d\n",hw_event->bp_type);
-   SUBDBG("   config1: %#lx (%lu)\n",hw_event->config1,hw_event->config1);
-   SUBDBG("   config2: %#lx (%lu)\n",hw_event->config2,hw_event->config2);
-   SUBDBG("   branch_sample_type: %lu\n",hw_event->branch_sample_type);
-   SUBDBG("   sample_regs_user: %lu\n",hw_event->sample_regs_user);
-   SUBDBG("   sample_stack_user: %d\n",hw_event->sample_stack_user);
-
-	ret = syscall( __NR_perf_event_open, hw_event, pid, cpu, group_fd, flags );
-	SUBDBG("Returned %d %d %s\n",ret,
-	       ret<0?errno:0,
-	       ret<0?strerror(errno):" ");
-	return ret;
-}
-
+/*****************************************************************/
+/********* Begin perf_event low-level code ***********************/
+/*****************************************************************/
 
 static int map_perf_event_errors_to_papi(int perf_event_error) {
 
@@ -537,14 +464,40 @@ close_pe_events( pe_context_t *ctx, pe_control_t *ctl )
    return PAPI_OK;
 }
 
-
-
-
 /********************************************************************/
-/* Component Interface                                              */
+/********************************************************************/
+/*     Functions that are exported via the component interface      */
+/********************************************************************/
 /********************************************************************/
 
+/********************* DOMAIN RELATED *******************************/
 
+/* set the domain. perf_events allows per-event control of this, papi allows it to be set at the event level or at the event set level. */
+/* this will set the event set level domain values but they only get used if no event level domain mask (u= or k=) was specified. */
+static int
+_peu_set_domain( hwd_control_state_t *ctl, int domain)
+{
+   pe_control_t *pe_ctl = ( pe_control_t *) ctl;
+
+   SUBDBG("old control domain %d, new domain %d\n",
+	  pe_ctl->domain,domain);
+
+   pe_ctl->domain = domain;
+   return PAPI_OK;
+}
+
+/********************* THREAD RELATED *******************************/
+
+/* Shutdown a thread */
+static int
+_peu_shutdown_thread( hwd_context_t *ctx )
+{
+    pe_context_t *pe_ctx = ( pe_context_t *) ctx;
+
+    pe_ctx->initialized=0;
+
+    return PAPI_OK;
+}
 
 /* Initialize a thread */
 static int
@@ -563,290 +516,7 @@ _peu_init_thread( hwd_context_t *hwd_ctx )
   return PAPI_OK;
 }
 
-/* Initialize a new control state */
-static int
-_peu_init_control_state( hwd_control_state_t *ctl )
-{
-  pe_control_t *pe_ctl = ( pe_control_t *) ctl;
-
-  /* clear the contents */
-  memset( pe_ctl, 0, sizeof ( pe_control_t ) );
-
-  /* Set the default domain */
-  _peu_set_domain( ctl, _perf_event_uncore_vector.cmp_info.default_domain );
-
-  /* Set the default granularity */
-  pe_ctl->granularity=_perf_event_uncore_vector.cmp_info.default_granularity;
-
-  pe_ctl->cidx=our_cidx;
-
-  /* Set cpu number in the control block to show events */
-  /* are not tied to specific cpu                       */
-  pe_ctl->cpu = -1;
-  return PAPI_OK;
-}
-
-
-
-/* Initialize the perf_event uncore component */
-static int
-_peu_init_component( int cidx )
-{
-
-   int retval;
-   int paranoid_level;
-
-   FILE *fff;
-   char *strCpy;
-
-   our_cidx=cidx;
-
-   /* The is the official way to detect if perf_event support exists */
-   /* The file is called perf_counter_paranoid on 2.6.31             */
-   /* currently we are lazy and do not support 2.6.31 kernels        */
-
-   fff=fopen("/proc/sys/kernel/perf_event_paranoid","r");
-   if (fff==NULL) {
-     strCpy=strncpy(_papi_hwd[cidx]->cmp_info.disabled_reason,
-	    "perf_event support not detected",PAPI_MAX_STR_LEN);
-     if (strCpy == NULL) HANDLE_STRING_ERROR;
-     retval = PAPI_ECMP;
-     goto fn_fail;
-   }
-   retval=fscanf(fff,"%d",&paranoid_level);
-   if (retval!=1) fprintf(stderr,"Error reading paranoid level\n");
-   fclose(fff);
-
-
-   /* Run the libpfm4-specific setup */
-
-   retval = _papi_libpfm4_init(_papi_hwd[cidx]);
-   if (retval) {
-     strCpy=strncpy(_papi_hwd[cidx]->cmp_info.disabled_reason,
-	     "Error initializing libpfm4",PAPI_MAX_STR_LEN);
-     _peu_shutdown_component( );
-     if (strCpy == NULL) HANDLE_STRING_ERROR;
-     retval = PAPI_ECMP;
-     goto fn_fail;
-   }
-
-
-   /* Run the uncore specific libpfm4 setup */
-
-   retval = _peu_libpfm4_init(_papi_hwd[cidx], our_cidx,
-			       &uncore_native_event_table,
-                               PMU_TYPE_UNCORE);
-   if (retval) {
-     strCpy=strncpy(_papi_hwd[cidx]->cmp_info.disabled_reason,
-	     "Error setting up libpfm4",PAPI_MAX_STR_LEN);
-     _peu_shutdown_component( );
-     if (strCpy == NULL) HANDLE_STRING_ERROR;
-     retval = PAPI_ECMP;
-     goto fn_fail;
-   }
-
-   /* Check if no uncore events found */
-
-   if (_papi_hwd[cidx]->cmp_info.num_native_events==0) {
-     strCpy=strncpy(_papi_hwd[cidx]->cmp_info.disabled_reason,
-	     "No uncore PMUs or events found",PAPI_MAX_STR_LEN);
-     _peu_shutdown_component( );
-     if (strCpy == NULL) HANDLE_STRING_ERROR;
-     retval = PAPI_ECMP;
-     goto fn_fail;
-   }
-
-   /* Check if we have enough permissions for uncore */
-
-   /* 2 means no kernel measurements allowed   */
-   /* 1 means normal counter access            */
-   /* 0 means you can access CPU-specific data */
-   /* -1 means no restrictions                 */
-
-   if ((paranoid_level>0) && (getuid()!=0)) {
-      strCpy=strncpy(_papi_hwd[cidx]->cmp_info.disabled_reason,
-	    "Insufficient permissions for uncore access.  Set /proc/sys/kernel/perf_event_paranoid to 0 or run as root.",
-	    PAPI_MAX_STR_LEN);
-      _peu_shutdown_component( );
-     if (strCpy == NULL) HANDLE_STRING_ERROR;
-     retval = PAPI_ECMP;
-     goto fn_fail;
-   }
-
-  fn_exit:
-   _papi_hwd[cidx]->cmp_info.disabled = retval;
-   return retval;
-  fn_fail:
-   goto fn_exit;
-
-}
-
-/* Shutdown the perf_event component */
-static int
-_peu_shutdown_component( void ) {
-
-	/* deallocate our event table */
-	_pe_libpfm4_shutdown(&_perf_event_uncore_vector,
-				&uncore_native_event_table);
-
-	/* Shutdown libpfm4 */
-	_papi_libpfm4_shutdown(&_perf_event_uncore_vector);
-
-	return PAPI_OK;
-}
-
-/* This function clears the current contents of the control structure and
-   updates it with whatever resources are allocated for all the native events
-   in the native info structure array. */
-
-int
-_peu_update_control_state( hwd_control_state_t *ctl,
-			       NativeInfo_t *native,
-			       int count, hwd_context_t *ctx )
-{
-	int i;
-	int j;
-	int ret;
-	int skipped_events=0;
-	struct native_event_t *ntv_evt;
-   pe_context_t *pe_ctx = ( pe_context_t *) ctx;
-   pe_control_t *pe_ctl = ( pe_control_t *) ctl;
-
-   /* close all of the existing fds and start over again */
-   /* In theory we could have finer-grained control and know if             */
-   /* things were changed, but it's easier to tear things down and rebuild. */
-   close_pe_events( pe_ctx, pe_ctl );
-
-   /* Calling with count==0 should be OK, it's how things are deallocated */
-   /* when an eventset is destroyed.                                      */
-   if ( count == 0 ) {
-      SUBDBG( "Called with count == 0\n" );
-      return PAPI_OK;
-   }
-
-   /* set up all the events */
-   for( i = 0; i < count; i++ ) {
-      if ( native ) {
-			// get the native event pointer used for this papi event
-			int ntv_idx = _papi_hwi_get_ntv_idx((unsigned)(native[i].ni_papi_code));
-			if (ntv_idx < -1) {
-				SUBDBG("papi_event_code: %#x known by papi but not by the component\n", native[i].ni_papi_code);
-				continue;
-			}
-			// if native index is -1, then we have an event without a mask and need to find the right native index to use
-			if (ntv_idx == -1) {
-				// find the native event index we want by matching for the right papi event code
-				for (j=0 ; j<pe_ctx->event_table->num_native_events ; j++) {
-					if (pe_ctx->event_table->native_events[j].papi_event_code == native[i].ni_papi_code) {
-						ntv_idx = j;
-					}
-				}
-			}
-
-			// if native index is still negative, we did not find event we wanted so just return error
-			if (ntv_idx < 0) {
-				SUBDBG("papi_event_code: %#x not found in native event tables\n", native[i].ni_papi_code);
-				continue;
-			}
-
-			// this native index is positive so there was a mask with the event, the ntv_idx identifies which native event to use
-			ntv_evt = (struct native_event_t *)(&(pe_ctx->event_table->native_events[ntv_idx]));
-
-			SUBDBG("ntv_evt: %p\n", ntv_evt);
-
-			SUBDBG("i: %d, pe_ctx->event_table->num_native_events: %d\n", i, pe_ctx->event_table->num_native_events);
-
-	    	// Move this events hardware config values and other attributes to the perf_events attribute structure
-			memcpy (&pe_ctl->events[i].attr, &ntv_evt->attr, sizeof(perf_event_attr_t));
-
-			// may need to update the attribute structure with information from event set level domain settings (values set by PAPI_set_domain)
-			// only done if the event mask which controls each counting domain was not provided
-
-			// get pointer to allocated name, will be NULL when adding preset events to event set
-			char *aName = ntv_evt->allocated_name;
-			if ((aName == NULL)  ||  (strstr(aName, ":u=") == NULL)) {
-				SUBDBG("set exclude_user attribute from eventset level domain flags, encode: %d, eventset: %d\n", pe_ctl->events[i].attr.exclude_user, !(pe_ctl->domain & PAPI_DOM_USER));
-				pe_ctl->events[i].attr.exclude_user = !(pe_ctl->domain & PAPI_DOM_USER);
-			}
-			if ((aName == NULL)  ||  (strstr(aName, ":k=") == NULL)) {
-				SUBDBG("set exclude_kernel attribute from eventset level domain flags, encode: %d, eventset: %d\n", pe_ctl->events[i].attr.exclude_kernel, !(pe_ctl->domain & PAPI_DOM_KERNEL));
-				pe_ctl->events[i].attr.exclude_kernel = !(pe_ctl->domain & PAPI_DOM_KERNEL);
-			}
-
-			// set the cpu number provided with an event mask if there was one (will be -1 if mask not provided)
-			pe_ctl->events[i].cpu = ntv_evt->cpu;
-			// if cpu event mask not provided, then set the cpu to use to what may have been set on call to PAPI_set_opt (will still be -1 if not called)
-			if (pe_ctl->events[i].cpu == -1) {
-				pe_ctl->events[i].cpu = pe_ctl->cpu;
-			}
-      } else {
-    	  // This case happens when called from _pe_set_overflow and _pe_ctl
-          // Those callers put things directly into the pe_ctl structure so it is already set for the open call
-      }
-
-      // Copy the inherit flag into the attribute block that will be passed to the kernel
-      pe_ctl->events[i].attr.inherit = pe_ctl->inherit;
-
-      /* Set the position in the native structure */
-      /* We just set up events linearly           */
-      if ( native ) {
-    	  native[i].ni_position = i;
-    	  SUBDBG( "&native[%d]: %p, ni_papi_code: %#x, ni_event: %#x, ni_position: %d, ni_owners: %d\n",
-			i, &(native[i]), native[i].ni_papi_code, native[i].ni_event, native[i].ni_position, native[i].ni_owners);
-      }
-   }
-
-	if (count <= skipped_events) {
-		SUBDBG("EXIT: No events to count, they all contained invalid umasks\n");
-		return PAPI_ENOEVNT;
-	}
-
-  pe_ctl->num_events = count - skipped_events;
-
-   /* actuall open the events */
-   /* (why is this a separate function?) */
-   ret = open_pe_events( pe_ctx, pe_ctl );
-   if ( ret != PAPI_OK ) {
-      SUBDBG("open_pe_events failed\n");
-      /* Restore values ? */
-      return ret;
-   }
-
-   SUBDBG( "EXIT: PAPI_OK\n" );
-   return PAPI_OK;
-}
-
-/********************************************************************/
-/********************************************************************/
-/* Start with functions that are exported via the module interface  */
-/********************************************************************/
-/********************************************************************/
-
-
-/* set the domain. perf_events allows per-event control of this, papi allows it to be set at the event level or at the event set level. */
-/* this will set the event set level domain values but they only get used if no event level domain mask (u= or k=) was specified. */
-static int
-_peu_set_domain( hwd_control_state_t *ctl, int domain)
-{
-   pe_control_t *pe_ctl = ( pe_control_t *) ctl;
-
-   SUBDBG("old control domain %d, new domain %d\n",
-	  pe_ctl->domain,domain);
-
-   pe_ctl->domain = domain;
-   return PAPI_OK;
-}
-
-/* Shutdown a thread */
-static int
-_peu_shutdown_thread( hwd_context_t *ctx )
-{
-    pe_context_t *pe_ctx = ( pe_context_t *) ctx;
-
-    pe_ctx->initialized=0;
-
-    return PAPI_OK;
-}
+/**************************** COUNTER RELATED *******************/
 
 
 /* reset the hardware counters */
@@ -1142,6 +812,130 @@ _peu_stop( hwd_context_t *ctx, hwd_control_state_t *ctl )
    return PAPI_OK;
 }
 
+/*********************** CONTROL STATE RELATED *******************/
+
+
+/* This function clears the current contents of the control structure and
+   updates it with whatever resources are allocated for all the native events
+   in the native info structure array. */
+
+int
+_peu_update_control_state( hwd_control_state_t *ctl,
+			       NativeInfo_t *native,
+			       int count, hwd_context_t *ctx )
+{
+	int i;
+	int j;
+	int ret;
+	int skipped_events=0;
+	struct native_event_t *ntv_evt;
+   pe_context_t *pe_ctx = ( pe_context_t *) ctx;
+   pe_control_t *pe_ctl = ( pe_control_t *) ctl;
+
+   /* close all of the existing fds and start over again */
+   /* In theory we could have finer-grained control and know if             */
+   /* things were changed, but it's easier to tear things down and rebuild. */
+   close_pe_events( pe_ctx, pe_ctl );
+
+   /* Calling with count==0 should be OK, it's how things are deallocated */
+   /* when an eventset is destroyed.                                      */
+   if ( count == 0 ) {
+      SUBDBG( "Called with count == 0\n" );
+      return PAPI_OK;
+   }
+
+   /* set up all the events */
+   for( i = 0; i < count; i++ ) {
+      if ( native ) {
+			// get the native event pointer used for this papi event
+			int ntv_idx = _papi_hwi_get_ntv_idx((unsigned)(native[i].ni_papi_code));
+			if (ntv_idx < -1) {
+				SUBDBG("papi_event_code: %#x known by papi but not by the component\n", native[i].ni_papi_code);
+				continue;
+			}
+			// if native index is -1, then we have an event without a mask and need to find the right native index to use
+			if (ntv_idx == -1) {
+				// find the native event index we want by matching for the right papi event code
+				for (j=0 ; j<pe_ctx->event_table->num_native_events ; j++) {
+					if (pe_ctx->event_table->native_events[j].papi_event_code == native[i].ni_papi_code) {
+						ntv_idx = j;
+					}
+				}
+			}
+
+			// if native index is still negative, we did not find event we wanted so just return error
+			if (ntv_idx < 0) {
+				SUBDBG("papi_event_code: %#x not found in native event tables\n", native[i].ni_papi_code);
+				continue;
+			}
+
+			// this native index is positive so there was a mask with the event, the ntv_idx identifies which native event to use
+			ntv_evt = (struct native_event_t *)(&(pe_ctx->event_table->native_events[ntv_idx]));
+
+			SUBDBG("ntv_evt: %p\n", ntv_evt);
+
+			SUBDBG("i: %d, pe_ctx->event_table->num_native_events: %d\n", i, pe_ctx->event_table->num_native_events);
+
+	    	// Move this events hardware config values and other attributes to the perf_events attribute structure
+			memcpy (&pe_ctl->events[i].attr, &ntv_evt->attr, sizeof(perf_event_attr_t));
+
+			// may need to update the attribute structure with information from event set level domain settings (values set by PAPI_set_domain)
+			// only done if the event mask which controls each counting domain was not provided
+
+			// get pointer to allocated name, will be NULL when adding preset events to event set
+			char *aName = ntv_evt->allocated_name;
+			if ((aName == NULL)  ||  (strstr(aName, ":u=") == NULL)) {
+				SUBDBG("set exclude_user attribute from eventset level domain flags, encode: %d, eventset: %d\n", pe_ctl->events[i].attr.exclude_user, !(pe_ctl->domain & PAPI_DOM_USER));
+				pe_ctl->events[i].attr.exclude_user = !(pe_ctl->domain & PAPI_DOM_USER);
+			}
+			if ((aName == NULL)  ||  (strstr(aName, ":k=") == NULL)) {
+				SUBDBG("set exclude_kernel attribute from eventset level domain flags, encode: %d, eventset: %d\n", pe_ctl->events[i].attr.exclude_kernel, !(pe_ctl->domain & PAPI_DOM_KERNEL));
+				pe_ctl->events[i].attr.exclude_kernel = !(pe_ctl->domain & PAPI_DOM_KERNEL);
+			}
+
+			// set the cpu number provided with an event mask if there was one (will be -1 if mask not provided)
+			pe_ctl->events[i].cpu = ntv_evt->cpu;
+			// if cpu event mask not provided, then set the cpu to use to what may have been set on call to PAPI_set_opt (will still be -1 if not called)
+			if (pe_ctl->events[i].cpu == -1) {
+				pe_ctl->events[i].cpu = pe_ctl->cpu;
+			}
+      } else {
+    	  // This case happens when called from _pe_set_overflow and _pe_ctl
+          // Those callers put things directly into the pe_ctl structure so it is already set for the open call
+      }
+
+      // Copy the inherit flag into the attribute block that will be passed to the kernel
+      pe_ctl->events[i].attr.inherit = pe_ctl->inherit;
+
+      /* Set the position in the native structure */
+      /* We just set up events linearly           */
+      if ( native ) {
+    	  native[i].ni_position = i;
+    	  SUBDBG( "&native[%d]: %p, ni_papi_code: %#x, ni_event: %#x, ni_position: %d, ni_owners: %d\n",
+			i, &(native[i]), native[i].ni_papi_code, native[i].ni_event, native[i].ni_position, native[i].ni_owners);
+      }
+   }
+
+	if (count <= skipped_events) {
+		SUBDBG("EXIT: No events to count, they all contained invalid umasks\n");
+		return PAPI_ENOEVNT;
+	}
+
+  pe_ctl->num_events = count - skipped_events;
+
+   /* actuall open the events */
+   /* (why is this a separate function?) */
+   ret = open_pe_events( pe_ctx, pe_ctl );
+   if ( ret != PAPI_OK ) {
+      SUBDBG("open_pe_events failed\n");
+      /* Restore values ? */
+      return ret;
+   }
+
+   SUBDBG( "EXIT: PAPI_OK\n" );
+   return PAPI_OK;
+}
+
 /* Set various options on a control state */
 static int
 _peu_ctl( hwd_context_t *ctx, int code, _papi_int_option_t *option )
@@ -1257,6 +1051,30 @@ _peu_ctl( hwd_context_t *ctx, int code, _papi_int_option_t *option )
    }
 }
 
+/* Initialize a new control state */
+static int
+_peu_init_control_state( hwd_control_state_t *ctl )
+{
+  pe_control_t *pe_ctl = ( pe_control_t *) ctl;
+
+  /* clear the contents */
+  memset( pe_ctl, 0, sizeof ( pe_control_t ) );
+
+  /* Set the default domain */
+  _peu_set_domain( ctl, _perf_event_uncore_vector.cmp_info.default_domain );
+
+  /* Set the default granularity */
+  pe_ctl->granularity=_perf_event_uncore_vector.cmp_info.default_granularity;
+
+  pe_ctl->cidx=our_cidx;
+
+  /* Set cpu number in the control block to show events */
+  /* are not tied to specific cpu                       */
+  pe_ctl->cpu = -1;
+  return PAPI_OK;
+}
+
+/****************** EVENT NAME HANDLING CODE *****************/
 
 static int
 _peu_ntv_enum_events( unsigned int *PapiEventCode, int modifier )
@@ -1307,6 +1125,119 @@ _peu_ntv_code_to_info(unsigned int EventCode,
 
   return _pe_libpfm4_ntv_code_to_info(EventCode, info,
                                         &uncore_native_event_table);
+}
+
+/*********************** SAMPLING / PROFILING *******************/
+
+/* N/A */
+
+/************ INITIALIZATION / SHUTDOWN CODE *********************/
+
+/* Shutdown the perf_event component */
+static int
+_peu_shutdown_component( void ) {
+
+	/* deallocate our event table */
+	_pe_libpfm4_shutdown(&_perf_event_uncore_vector,
+				&uncore_native_event_table);
+
+	/* Shutdown libpfm4 */
+	_papi_libpfm4_shutdown(&_perf_event_uncore_vector);
+
+	return PAPI_OK;
+}
+
+/* Initialize the perf_event uncore component */
+static int
+_peu_init_component( int cidx )
+{
+
+   int retval;
+   int paranoid_level;
+
+   FILE *fff;
+   char *strCpy;
+
+   our_cidx=cidx;
+
+   /* The is the official way to detect if perf_event support exists */
+   /* The file is called perf_counter_paranoid on 2.6.31             */
+   /* currently we are lazy and do not support 2.6.31 kernels        */
+
+   fff=fopen("/proc/sys/kernel/perf_event_paranoid","r");
+   if (fff==NULL) {
+     strCpy=strncpy(_papi_hwd[cidx]->cmp_info.disabled_reason,
+	    "perf_event support not detected",PAPI_MAX_STR_LEN);
+     if (strCpy == NULL) HANDLE_STRING_ERROR;
+     retval = PAPI_ECMP;
+     goto fn_fail;
+   }
+   retval=fscanf(fff,"%d",&paranoid_level);
+   if (retval!=1) fprintf(stderr,"Error reading paranoid level\n");
+   fclose(fff);
+
+
+   /* Run the libpfm4-specific setup */
+
+   retval = _papi_libpfm4_init(_papi_hwd[cidx]);
+   if (retval) {
+     strCpy=strncpy(_papi_hwd[cidx]->cmp_info.disabled_reason,
+	     "Error initializing libpfm4",PAPI_MAX_STR_LEN);
+     _peu_shutdown_component( );
+     if (strCpy == NULL) HANDLE_STRING_ERROR;
+     retval = PAPI_ECMP;
+     goto fn_fail;
+   }
+
+
+   /* Run the uncore specific libpfm4 setup */
+
+   retval = _peu_libpfm4_init(_papi_hwd[cidx], our_cidx,
+			       &uncore_native_event_table,
+                               PMU_TYPE_UNCORE);
+   if (retval) {
+     strCpy=strncpy(_papi_hwd[cidx]->cmp_info.disabled_reason,
+	     "Error setting up libpfm4",PAPI_MAX_STR_LEN);
+     _peu_shutdown_component( );
+     if (strCpy == NULL) HANDLE_STRING_ERROR;
+     retval = PAPI_ECMP;
+     goto fn_fail;
+   }
+
+   /* Check if no uncore events found */
+
+   if (_papi_hwd[cidx]->cmp_info.num_native_events==0) {
+     strCpy=strncpy(_papi_hwd[cidx]->cmp_info.disabled_reason,
+	     "No uncore PMUs or events found",PAPI_MAX_STR_LEN);
+     _peu_shutdown_component( );
+     if (strCpy == NULL) HANDLE_STRING_ERROR;
+     retval = PAPI_ECMP;
+     goto fn_fail;
+   }
+
+   /* Check if we have enough permissions for uncore */
+
+   /* 2 means no kernel measurements allowed   */
+   /* 1 means normal counter access            */
+   /* 0 means you can access CPU-specific data */
+   /* -1 means no restrictions                 */
+
+   if ((paranoid_level>0) && (getuid()!=0)) {
+      strCpy=strncpy(_papi_hwd[cidx]->cmp_info.disabled_reason,
+	    "Insufficient permissions for uncore access.  Set /proc/sys/kernel/perf_event_paranoid to 0 or run as root.",
+	    PAPI_MAX_STR_LEN);
+      _peu_shutdown_component( );
+     if (strCpy == NULL) HANDLE_STRING_ERROR;
+     retval = PAPI_ECMP;
+     goto fn_fail;
+   }
+
+  fn_exit:
+   _papi_hwd[cidx]->cmp_info.disabled = retval;
+   return retval;
+  fn_fail:
+   goto fn_exit;
+
 }
 
 /* Our component vector */

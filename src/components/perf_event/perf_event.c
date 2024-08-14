@@ -19,7 +19,7 @@
 *          the ability to set cpu number to use or control the domain (user, kernel, or both)
 *          in which the counter should be incremented.  These are event masks so it is now 
 *          possible to have multiple events in the same event set that count activity from 
-*          differennt cpu's or count activity in different domains.
+*          different cpus or count activity in different domains.
 */
 
 
